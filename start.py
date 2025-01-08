@@ -2,20 +2,16 @@ import discord
 from discord.ext import commands
 import yaml
 import os
+from typing import List
 
-# ------------------------------------------------
-# 1. 設定ファイル (config.yml) を読み込み
-# ------------------------------------------------
+# ------------- 1. 設定読み込み -------------
 with open('config.yml', 'r', encoding='utf-8') as f:
     config = yaml.safe_load(f)
 
 TOKEN = config['token']
-COMMAND_CHANNEL_ID = config['command_channel_id']  # コマンドOKなテキストチャンネル
-VOICE_CHANNEL_IDS = config['voice_channel_ids']    # 通知対象のVCリスト
+COMMAND_CHANNEL_ID = config['command_channel_id']  # コマンド実行チャンネル
+VOICE_CHANNEL_IDS = config['voice_channel_ids']    # 通知対象VCのID
 
-# ------------------------------------------------
-# 2. user_config.yml の読み込み・初期化
-# ------------------------------------------------
 USER_CONFIG_FILE = 'user_config.yml'
 if not os.path.exists(USER_CONFIG_FILE):
     with open(USER_CONFIG_FILE, 'w', encoding='utf-8') as f:
@@ -28,29 +24,74 @@ def save_user_config():
     with open(USER_CONFIG_FILE, 'w', encoding='utf-8') as f:
         yaml.dump(user_config, f, allow_unicode=True)
 
-# ------------------------------------------------
-# 3. Bot本体とIntents
-# ------------------------------------------------
+    # ------ ここで再読み込み ------
+    with open(USER_CONFIG_FILE, 'r', encoding='utf-8') as f:
+        new_config = yaml.safe_load(f)
+    user_config.clear()
+    user_config.update(new_config)
+
+# ------------- 2. Botセットアップ -------------
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# ===================================================
+# モーダル (検索用)
+# ===================================================
+class SearchModal(discord.ui.Modal):
+    """ユーザーが検索ワードを入力するモーダル"""
+    def __init__(self, user_id: str):
+        super().__init__(title="メンバー検索")
+        self.user_id = user_id
 
-# ------------------------------------------------
-# 4. UIコンポーネント（SelectMenu, 確定ボタン, 削除ボタン）
-# ------------------------------------------------
-class MemberSelect(discord.ui.Select):
-    """
-    サーバーメンバーを表示するSelectMenu。
-    一旦 self.selected_members に選択されたメンバーIDリストを保持し、
-    確定ボタンが押されたときに user_config に保存する。
-    """
-    def __init__(self, members: list[discord.Member]):
+        self.search_input = discord.ui.TextInput(
+            label="検索したい文字列を入力",
+            placeholder="例) user / abc ...",
+            min_length=1,
+            max_length=50
+        )
+        self.add_item(self.search_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        query = self.search_input.value.lower()
+        guild_members = [m for m in interaction.guild.members if not m.bot]
+        matched = []
+
+        for m in guild_members:
+            # 大文字・小文字を区別しない部分一致
+            if query in m.name.lower():
+                matched.append(m)
+
+        # SelectMenuは25件までなのでスライス
+        matched = matched[:25]
+
+        if not matched:
+            await interaction.response.send_message(
+                f"「{query}」に一致するメンバーが見つかりませんでした。",
+                ephemeral=True
+            )
+            return
+
+        # 一致したメンバーを表示するSelectMenu
+        view = SelectResultView(self.user_id, matched)
+        await interaction.response.send_message(
+            content=f"検索結果: {len(matched)} 名。該当メンバーを選んで、【確定】または【削除】を押してください。",
+            view=view,
+            ephemeral=True
+        )
+
+# ===================================================
+# SelectMenu & ボタン類
+# ===================================================
+class SelectResultMenu(discord.ui.Select):
+    """検索結果を表示するSelectMenu"""
+    def __init__(self, user_id: str, members: List[discord.Member]):
+        self.user_id = user_id
         options = [
             discord.SelectOption(label=m.name, value=str(m.id))
             for m in members
         ]
         super().__init__(
-            placeholder="通知したいメンバーを選択(複数可)",
+            placeholder="追加or削除したいメンバーを選択 (複数可)",
             min_values=1,
             max_values=len(options),
             options=options
@@ -58,154 +99,148 @@ class MemberSelect(discord.ui.Select):
         self.selected_members = []
 
     async def callback(self, interaction: discord.Interaction):
-        # 選択されたメンバーのIDを保持
         self.selected_members = self.values
-        await interaction.response.defer()  # 特に表示を変えないなら defer() でOK
+        await interaction.response.defer()
 
 
 class ConfirmButton(discord.ui.Button):
-    """
-    「確定」ボタン。
-    押されたとき、SelectMenuに格納されている selected_members を user_config に保存する。
-    """
+    """選択したメンバーを通知リストに【追加】登録するボタン"""
     def __init__(self, user_id: str):
-        super().__init__(label="確定", style=discord.ButtonStyle.green)
+        super().__init__(label="確定", style=discord.ButtonStyle.primary)
         self.user_id = user_id
 
     async def callback(self, interaction: discord.Interaction):
-        view: MemberSelectView = self.view
-        select: MemberSelect = view.select_menu
+        view: SelectResultView = self.view
+        select_menu: SelectResultMenu = view.select_menu
 
-        # user_config に反映
-        if self.user_id not in user_config['users']:
-            user_config['users'][self.user_id] = {'selected_members': []}
-        user_config['users'][self.user_id]['selected_members'] = select.selected_members
+        if self.user_id not in user_config["users"]:
+            user_config["users"][self.user_id] = {"selected_members": []}
+
+        existing = set(user_config["users"][self.user_id].get("selected_members", []))
+        selected = set(select_menu.selected_members)
+        updated = existing | selected  # union = 追加
+
+        user_config["users"][self.user_id]["selected_members"] = list(updated)
         save_user_config()
 
         await interaction.response.send_message(
-            f"{len(select.selected_members)}名を登録しました。",
+            f"{len(selected)}名を通知リストに追加しました。",
             ephemeral=True
         )
 
-        # ボタンやセレクトを無効化して操作不可に
         for child in view.children:
             child.disabled = True
         await interaction.edit_original_response(view=view)
 
 
-class DeleteButton(discord.ui.Button):
-    """
-    「削除」ボタン。
-    押されたとき、登録されている selected_members を空にする。
-    """
+class RemoveButton(discord.ui.Button):
+    """選択したメンバーを通知リストから【削除】するボタン"""
     def __init__(self, user_id: str):
         super().__init__(label="削除", style=discord.ButtonStyle.danger)
         self.user_id = user_id
 
     async def callback(self, interaction: discord.Interaction):
-        # user_config から該当ユーザーの selected_members を削除
-        if self.user_id not in user_config['users']:
-            await interaction.response.send_message("登録情報がありません。", ephemeral=True)
-        else:
-            user_config['users'][self.user_id]['selected_members'] = []
-            save_user_config()
-            await interaction.response.send_message("登録メンバーを削除しました。", ephemeral=True)
+        view: SelectResultView = self.view
+        select_menu: SelectResultMenu = view.select_menu
 
-        # ボタンやセレクトを無効化して操作不可に
-        view: MemberSelectView = self.view
+        if self.user_id not in user_config["users"]:
+            await interaction.response.send_message("通知リストがありません。", ephemeral=True)
+        else:
+            existing = set(user_config["users"][self.user_id].get("selected_members", []))
+            selected = set(select_menu.selected_members)
+            updated = existing - selected  # 差集合 = 削除
+
+            user_config["users"][self.user_id]["selected_members"] = list(updated)
+            save_user_config()
+            await interaction.response.send_message(
+                f"{len(selected)}名を通知リストから削除しました。",
+                ephemeral=True
+            )
+
         for child in view.children:
             child.disabled = True
         await interaction.edit_original_response(view=view)
 
 
-class MemberSelectView(discord.ui.View):
-    """
-    SelectMenu, 確定ボタン, 削除ボタンをひとまとめにしたView。
-    """
-    def __init__(self, user_id: str, members: list[discord.Member]):
+class SelectResultView(discord.ui.View):
+    """SelectMenu + 確定ボタン(追加) + 削除ボタン"""
+    def __init__(self, user_id: str, members: List[discord.Member]):
         super().__init__(timeout=None)
         self.user_id = user_id
-
-        self.select_menu = MemberSelect(members)
+        self.select_menu = SelectResultMenu(user_id, members)
         self.add_item(self.select_menu)
-
-        confirm_button = ConfirmButton(user_id)
-        self.add_item(confirm_button)
-
-        delete_button = DeleteButton(user_id)
-        self.add_item(delete_button)
+        self.add_item(ConfirmButton(user_id))
+        self.add_item(RemoveButton(user_id))
 
 
-# ------------------------------------------------
-# 5. スラッシュコマンド (/tuuti)
-# ------------------------------------------------
-@bot.tree.command(name="tuuti", description="通知したいメンバーを登録する")
-async def start_command(interaction: discord.Interaction):
-    """
-    特定のテキストチャンネルでのみ反応。
-    メンバー選択UIを同じチャンネル内に表示する。
-    """
-    # 1) コマンド打ったチャンネルが指定のIDか確認
+class SearchButton(discord.ui.Button):
+    """「検索」ボタン。押すと検索用モーダルを出す"""
+    def __init__(self, user_id: str):
+        super().__init__(label="検索", style=discord.ButtonStyle.primary)
+        self.user_id = user_id
+
+    async def callback(self, interaction: discord.Interaction):
+        modal = SearchModal(self.user_id)
+        await interaction.response.send_modal(modal)
+
+
+class SearchView(discord.ui.View):
+    """最初の画面で出す「検索」ボタンのみのView"""
+    def __init__(self, user_id: str):
+        super().__init__(timeout=None)
+        self.add_item(SearchButton(user_id))
+
+# ===============================================
+# スラッシュコマンド (/search) : エントリポイント
+# ===============================================
+@bot.tree.command(name="search", description="検索してメンバーを追加または削除する")
+async def search_command(interaction: discord.Interaction):
+    # コマンド実行チャンネルが特定のIDでなければ弾く
     if interaction.channel.id != COMMAND_CHANNEL_ID:
         await interaction.response.send_message(
-            "このコマンドは特定のテキストチャンネルでのみ使用できます。",
+            "このコマンドは指定されたチャンネルでのみ使用できます。",
             ephemeral=True
         )
         return
 
     user_id = str(interaction.user.id)
-    # ユーザーのエントリが無ければ初期化
-    if user_id not in user_config['users']:
-        user_config['users'][user_id] = {'selected_members': []}
+    if user_id not in user_config["users"]:
+        user_config["users"][user_id] = {"selected_members": []}
         save_user_config()
 
-    # 2) サーバーの全メンバー（Botは除外 etc.）を取得
-    guild_members = [m for m in interaction.guild.members if not m.bot]
-
-    # 3) Viewを作って返す (同じチャンネルにUIが表示される)
-    view = MemberSelectView(user_id, guild_members)
+    view = SearchView(user_id)
     await interaction.response.send_message(
-        content="通知したいメンバーを選択し、確定または削除を押してください。",
+        "「検索」ボタンを押して、通知リストに追加/削除したいメンバーを探してください。",
         view=view,
-        ephemeral=True  # 他のユーザーに見えなくて良い場合はTrueにする
+        ephemeral=True
     )
 
-
-# ------------------------------------------------
-# 6. VC参加を監視し、DMで通知
-# ------------------------------------------------
+# ===========================
+# VC参加→DM通知 (既存の処理)
+# ===========================
 @bot.event
 async def on_voice_state_update(member, before, after):
-    """
-    誰かがVCに移動したら、通知対象に登録されているかチェックし、
-    該当するユーザー(複数の可能性あり)にDMを飛ばす。
-    """
     if before.channel == after.channel:
         return
     if after.channel is None:
         return
-
     if after.channel.id not in VOICE_CHANNEL_IDS:
         return
 
     moved_member_id_str = str(member.id)
-
-    for user_id, data in user_config.get('users', {}).items():
-        selected_ids = data.get('selected_members', [])
+    for user_id, data in user_config.get("users", {}).items():
+        selected_ids = data.get("selected_members", [])
         if moved_member_id_str in selected_ids:
             try:
                 user_to_notify = await bot.fetch_user(int(user_id))
-                if user_to_notify is not None:
+                if user_to_notify:
                     await user_to_notify.send(
-                        f"**{member.guild.name}** で、**{member.name}** さんが VC **{after.channel.name}** に参加しました！"
+                        f"【{member.guild.name}】\n"
+                        f"{member.name} さんがVC「{after.channel.name}」に参加しました。"
                     )
             except Exception as e:
                 print("DM送信エラー:", e)
 
-
-# ------------------------------------------------
-# 7. Bot起動 & コマンド同期
-# ------------------------------------------------
 @bot.event
 async def on_ready():
     await bot.tree.sync()

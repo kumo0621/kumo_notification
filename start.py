@@ -45,7 +45,7 @@ class SearchModal(discord.ui.Modal):
 
         self.search_input = discord.ui.TextInput(
             label="検索したい文字列を入力",
-            placeholder="例) user / abc ...",
+            placeholder="検索したいユーザー名",
             min_length=1,
             max_length=50
         )

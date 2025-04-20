@@ -305,6 +305,18 @@ async def on_voice_state_update(member, before, after):
     for user_id, data in user_config.get("users", {}).items():
         selected_ids = data.get("selected_members", [])
         if moved_member_id_str in selected_ids:
+            # DiscordのUserオブジェクト→Guild内のMemberオブジェクトを取得
+            notify_member = member.guild.get_member(int(user_id))
+            
+            # 該当ギルドにメンバーがいない or 取得できなかった場合はそのままDM送信を試行
+            if notify_member:
+                # すでに同じVCにいる場合は通知をスキップ
+                if (
+                    notify_member.voice and
+                    notify_member.voice.channel and
+                    notify_member.voice.channel.id == after.channel.id
+                ):
+                    continue
             try:
                 # ユーザーを取得
                 user_to_notify = await bot.fetch_user(int(user_id))

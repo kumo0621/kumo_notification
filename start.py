@@ -2,7 +2,8 @@ import discord
 from discord.ext import commands
 import yaml
 import os
-from typing import List
+import time
+from typing import List, Dict
 
 # ------------- 1. 設定読み込み -------------
 with open('config.yml', 'r', encoding='utf-8') as f:
@@ -11,6 +12,7 @@ with open('config.yml', 'r', encoding='utf-8') as f:
 TOKEN = config['token']
 COMMAND_CHANNEL_ID = config['command_channel_id']  # コマンド実行チャンネル
 VOICE_CHANNEL_IDS = config['voice_channel_ids']    # 通知対象VCのID
+COOLDOWN_MINUTES = 30  # 通知クールダウン時間（分）
 
 USER_CONFIG_FILE = 'user_config.yml'
 if not os.path.exists(USER_CONFIG_FILE):
@@ -26,6 +28,10 @@ def save_user_config():
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# VC退出時間を記録するマップ
+# キー: メンバーID (str)、値: 最後に退出した時間（Unix時間）
+last_leave_times: Dict[str, float] = {}
 
 
 # ===================================================
@@ -254,34 +260,86 @@ async def search_command(interaction: discord.Interaction):
     )
 
 # ===========================
-# 6. VC参加→DM通知 (既存の処理)
+# 6. VC参加→DM通知 (既存の処理+クールダウン機能追加)
 # ===========================
 @bot.event
 async def on_voice_state_update(member, before, after):
+    # 1. 状態変化の判定
+    # チャンネル変更なし、または退出の場合
     if before.channel == after.channel:
         return
-    if after.channel is None:
-        return
-    if after.channel.id not in VOICE_CHANNEL_IDS:
-        return
 
+    # NoneTypeエラー回避のための安全チェック
+    if member is None:
+        print("警告: メンバーがNoneです")
+        return
+    
     moved_member_id_str = str(member.id)
+    
+    # 退出イベントの場合は、退出時間を記録
+    if after.channel is None and before.channel is not None:
+        last_leave_times[moved_member_id_str] = time.time()
+        print(f"{member.name} さんがVC「{before.channel.name}」から退出しました。時間を記録します。")
+        return
+    
+    # 参加イベントでない、または監視対象VCでない場合
+    if after.channel is None or after.channel.id not in VOICE_CHANNEL_IDS:
+        return
+    
+    # 2. クールダウンチェック - 30分以内の再入室なら通知しない
+    current_time = time.time()
+    if moved_member_id_str in last_leave_times:
+        last_leave_time = last_leave_times[moved_member_id_str]
+        time_diff_minutes = (current_time - last_leave_time) / 60
+        
+        # 30分以内の再入室の場合は通知をキャンセル
+        if time_diff_minutes < COOLDOWN_MINUTES:
+            print(f"{member.name} さんの再入室ですが、前回の退出から{time_diff_minutes:.1f}分しか経っていないため通知をキャンセルします")
+            return
+    
+    # メンバーがVCに参加したことをログに出力
+    if after.channel:
+        print(f"{member.name} さんがVC「{after.channel.name}」に参加しました。通知処理を開始します。")
+    
+    # 3. 通知処理
     for user_id, data in user_config.get("users", {}).items():
         selected_ids = data.get("selected_members", [])
         if moved_member_id_str in selected_ids:
             try:
+                # ユーザーを取得
                 user_to_notify = await bot.fetch_user(int(user_id))
-                if user_to_notify:
+                
+                # ユーザーが存在するか確認
+                if user_to_notify is None:
+                    print(f"警告: ユーザーID {user_id} が見つかりません")
+                    continue
+                
+                # DMを送信
+                try:
+                    # VC名とサーバー名の安全チェック
+                    guild_name = member.guild.name if member.guild else "不明なサーバー"
+                    channel_name = after.channel.name if after.channel else "不明なチャンネル"
+                    
                     await user_to_notify.send(
-                        f"【{member.guild.name}】\n"
-                        f"{member.name} さんがVC「{after.channel.name}」に参加しました。"
+                        f"【{guild_name}】\n"
+                        f"{member.name} さんがVC「{channel_name}」に参加しました。"
                     )
+                    print(f"{member.name} さんの参加を {user_to_notify.name} さんに通知しました")
+                except discord.Forbidden as e:
+                    # DMが禁止されている場合（プライバシー設定など）
+                    print(f"DM送信エラー: {e} - ユーザー {user_to_notify.name} (ID: {user_id}) はDMを受け取れません")
+                except Exception as e:
+                    print(f"DM送信エラー: {e} - ユーザー {user_to_notify.name} (ID: {user_id})")
+            except discord.NotFound:
+                print(f"エラー: ユーザーID {user_id} は存在しません")
             except Exception as e:
-                print("DM送信エラー:", e)
+                print(f"通知処理エラー: {e} - ユーザーID {user_id}")
 
 @bot.event
 async def on_ready():
     await bot.tree.sync()
     print(f"Logged in as {bot.user}")
+    print(f"監視対象VCチャンネル: {VOICE_CHANNEL_IDS}")
+    print(f"通知クールダウン時間: {COOLDOWN_MINUTES}分")
 
 bot.run(TOKEN)
